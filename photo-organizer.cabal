@@ -21,6 +21,7 @@ executable photo-organizer
                     , PhotoOrganizer.Cluster
                     , PhotoOrganizer.Interactive
                     , PhotoOrganizer.Mover
+                    , PhotoOrganizer.WebUI
     build-depends:    base >= 4.17 && < 5
                     , directory
                     , filepath
@@ -30,6 +31,13 @@ executable photo-organizer
                     , containers
                     , mtl
                     , transformers
+                    , scotty
+                    , aeson
+                    , warp
+                    , wai
+                    , http-types
+                    , bytestring
+                    , stm
     hs-source-dirs:   app
     default-language: GHC2021
     default-extensions: OverloadedStrings
