@@ -1,0 +1,37 @@
+cabal-version:      3.0
+name:               photo-organizer
+version:            0.1.0.0
+synopsis:           Organize photos from iCloud to Google Drive
+license:            MIT
+license-file:       LICENSE
+author:             Leonardo Gavaudan
+maintainer:         leonardogavaudan@gmail.com
+category:           Utility
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+
+common warnings
+    ghc-options: -Wall -Wno-unused-do-bind
+
+executable photo-organizer
+    import:           warnings
+    main-is:          Main.hs
+    other-modules:    PhotoOrganizer.Types
+                    , PhotoOrganizer.Scanner
+                    , PhotoOrganizer.Cluster
+                    , PhotoOrganizer.Interactive
+                    , PhotoOrganizer.Mover
+    build-depends:    base >= 4.17 && < 5
+                    , directory
+                    , filepath
+                    , time
+                    , process
+                    , text
+                    , containers
+                    , mtl
+                    , transformers
+    hs-source-dirs:   app
+    default-language: GHC2021
+    default-extensions: OverloadedStrings
+                      , LambdaCase
+                      , RecordWildCards
