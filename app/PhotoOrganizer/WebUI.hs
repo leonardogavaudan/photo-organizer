@@ -1,4 +1,5 @@
 {-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 module PhotoOrganizer.WebUI
   ( runWebUI
@@ -7,59 +8,95 @@ module PhotoOrganizer.WebUI
 import PhotoOrganizer.Types
 
 import Control.Concurrent.STM
-import Control.Monad (forM, forM_, void, when)
+import Control.Monad (forM, forM_, void, when, filterM)
 import Control.Monad.IO.Class (liftIO)
-import Data.Aeson (ToJSON, FromJSON, decode, (.=), object)
+import Data.Aeson (ToJSON(..), FromJSON(..), decode, (.=), object, genericToJSON, genericParseJSON, camelTo2)
+import qualified Data.Aeson as Aeson
+import Data.Char (toLower)
+import Data.Hashable (hash)
 import qualified Data.Map.Strict as Map
+import Data.Time (utctDay)
+import Data.Time.Calendar (toGregorian)
 import Data.Map.Strict (Map)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Lazy as TL
 import GHC.Generics (Generic)
 import Network.HTTP.Types.Status (status404)
-import System.Directory (createDirectoryIfMissing, doesFileExist, copyFileWithMetadata, removeFile)
-import System.FilePath ((</>), takeFileName)
+import System.Directory (createDirectoryIfMissing, doesFileExist, copyFileWithMetadata, removeFile, listDirectory, doesDirectoryExist)
+import System.FilePath ((</>), takeFileName, takeExtension)
 import System.Process (createProcess, proc, StdStream(..), std_out, std_err, waitForProcess)
 import Web.Scotty
+
+-- | Generate a stable ID from a file path using hashing
+-- This ensures the same file always gets the same ID, regardless of scan order
+-- We limit to 2^53-1 (JavaScript's MAX_SAFE_INTEGER) to avoid precision loss in JSON
+stableFileId :: FilePath -> Int
+stableFileId path = abs (hash path) `mod` 9007199254740991
+
+-- | JSON options that strip prefixes and use snake_case
+jsonOptions :: String -> Aeson.Options
+jsonOptions prefix = Aeson.defaultOptions
+  { Aeson.fieldLabelModifier = camelTo2 '_' . drop (length prefix)
+  }
 
 -- | JSON representation of a cluster for the API
 data ClusterJSON = ClusterJSON
   { cjId :: Int
+  , cjYear :: Int
   , cjDate :: Text
   , cjTimeRange :: Text
-  , cjPhotos :: Int
-  , cjScreenshots :: Int
-  , cjVideos :: Int
-  , cjTotal :: Int
-  , cjType :: Text
+  , cjPhotoCount :: Int
+  , cjScreenshotCount :: Int
+  , cjVideoCount :: Int
+  , cjFileCount :: Int
+  , cjClusterType :: Text
   , cjFolderName :: Maybe Text
-  , cjImages :: [ImageJSON]
+  , cjFiles :: [ImageJSON]
   } deriving (Generic, Show)
 
-instance ToJSON ClusterJSON
+instance ToJSON ClusterJSON where
+  toJSON = genericToJSON (jsonOptions "cj")
 
 data ImageJSON = ImageJSON
   { ijId :: Int
-  , ijFileName :: Text
+  , ijName :: Text
   , ijPath :: Text
-  , ijType :: Text
-  , ijPreviewUrl :: Text
+  , ijFileType :: Text
   } deriving (Generic, Show)
 
-instance ToJSON ImageJSON
+instance ToJSON ImageJSON where
+  toJSON = genericToJSON (jsonOptions "ij")
 
 data NameRequest = NameRequest
   { nrName :: Maybe Text
   } deriving (Generic, Show)
 
-instance FromJSON NameRequest
+instance FromJSON NameRequest where
+  parseJSON = genericParseJSON (jsonOptions "nr")
 
 data MoveRequest = MoveRequest
   { mrImageIds :: [Int]
   , mrTargetClusterId :: Int
   } deriving (Generic, Show)
 
-instance FromJSON MoveRequest
+instance FromJSON MoveRequest where
+  parseJSON = genericParseJSON (jsonOptions "mr")
+
+data MiscRequest = MiscRequest
+  { miscImageIds :: [Int]
+  } deriving (Generic, Show)
+
+instance FromJSON MiscRequest where
+  parseJSON = genericParseJSON (jsonOptions "misc")
+
+data FolderMoveRequest = FolderMoveRequest
+  { fmrImageIds :: [Int]
+  , fmrFolder :: Text
+  } deriving (Generic, Show)
+
+instance FromJSON FolderMoveRequest where
+  parseJSON = genericParseJSON (jsonOptions "fmr")
 
 -- | Application state
 data AppState = AppState
@@ -73,26 +110,32 @@ data AppState = AppState
 -- | Run the web UI
 runWebUI :: Config -> [Cluster] -> IO ()
 runWebUI cfg clusters = do
-  -- Setup image cache directory
+  -- Setup image cache directory (clear on startup to avoid stale cached images)
   let imageDir = "/tmp/photo-organizer-images"
+  -- Remove old cache files to ensure fresh previews with new stable IDs
+  cacheExists <- doesDirectoryExist imageDir
+  when cacheExists $ do
+    oldFiles <- listDirectory imageDir
+    forM_ oldFiles $ \f -> removeFile (imageDir </> f)
   createDirectoryIfMissing True imageDir
 
   -- Initialize state
   let clusterMap = Map.fromList [(clId c, c) | c <- clusters]
   clustersVar <- newTVarIO clusterMap
 
-  -- Build image -> cluster mapping and assign image IDs
+  -- Build image -> cluster mapping using stable path-based IDs
   let allImages = [(clId c, pf) | c <- clusters, pf <- clFiles c]
   imageClusterVar <- newTVarIO Map.empty
-  nextIdVar <- newTVarIO 1
+  nextIdVar <- newTVarIO 1  -- Keep for new cluster creation, but not used for image IDs
 
-  -- Assign IDs to all images
-  imageIdMap <- atomically $ do
-    forM allImages $ \(cid, pf) -> do
-      imgId <- readTVar nextIdVar
-      modifyTVar' nextIdVar (+1)
+  -- Assign stable IDs to all images based on file path hash
+  let imageIdMap = [(stableFileId (pfPath pf), pf) | (_, pf) <- allImages]
+
+  -- Initialize image -> cluster mapping with stable IDs
+  atomically $ do
+    forM_ allImages $ \(cid, pf) -> do
+      let imgId = stableFileId (pfPath pf)
       modifyTVar' imageClusterVar (Map.insert imgId cid)
-      pure (imgId, pf)
 
   -- Store image ID -> PhotoFile mapping
   let imageFileMap = Map.fromList imageIdMap
@@ -112,6 +155,10 @@ runWebUI cfg clusters = do
   putStrLn ""
 
   scotty 8080 $ do
+    -- Debug endpoint to check imageFileMap keys
+    get "/api/debug/keys" $ do
+      json (Map.keys imageFileMap)
+
     -- Main page
     get "/" $ do
       html $ TL.pack indexHtml
@@ -150,10 +197,123 @@ runWebUI cfg clusters = do
       case decode body' :: Maybe MoveRequest of
         Nothing -> status status404 >> text "Invalid request"
         Just req -> do
+          -- Get affected cluster IDs before moving
+          imgClusterMap <- liftIO $ readTVarIO (asImageCluster state)
+          let affectedClusterIds = [cid | imgId <- mrImageIds req, Just cid <- [Map.lookup imgId imgClusterMap]]
           liftIO $ atomically $ do
+            -- Move images to target cluster
             forM_ (mrImageIds req) $ \imgId ->
               modifyTVar' (asImageCluster state) (Map.insert imgId (mrTargetClusterId req))
+            -- Check for and remove empty source clusters
+            imgClusterMap' <- readTVar (asImageCluster state)
+            let remainingClusterIds = Map.elems imgClusterMap'
+            forM_ affectedClusterIds $ \cid ->
+              when (cid `notElem` remainingClusterIds) $
+                modifyTVar' (asClusters state) (Map.delete cid)
           json $ object ["status" .= ("ok" :: Text)]
+
+    -- Move images to Misc folder (creates if doesn't exist)
+    post "/api/move-to-misc" $ do
+      body' <- body
+      case decode body' :: Maybe MiscRequest of
+        Nothing -> status status404 >> text "Invalid request"
+        Just req -> do
+          -- Get affected cluster IDs before moving
+          imgClusterMap <- liftIO $ readTVarIO (asImageCluster state)
+          let affectedClusterIds = [cid | imgId <- miscImageIds req, Just cid <- [Map.lookup imgId imgClusterMap]]
+          let imagesToMove = [(imgId, imageFileMap Map.! imgId) | imgId <- miscImageIds req, Map.member imgId imageFileMap]
+          movedCount <- liftIO $ do
+            forM_ imagesToMove $ \(_, pf) -> do
+              let (year, _, _) = toGregorian $ utctDay $ pfDateTime pf
+                  destFolder = cfgDestDir (asConfig state) </> show year </> "Misc"
+              createDirectoryIfMissing True destFolder
+              let srcPath = pfPath pf
+                  destPath = destFolder </> takeFileName srcPath
+              copyFileWithMetadata srcPath destPath
+              removeFile srcPath
+            -- Remove images from cluster tracking and clean up empty clusters
+            atomically $ do
+              forM_ (miscImageIds req) $ \imgId ->
+                modifyTVar' (asImageCluster state) (Map.delete imgId)
+              -- Check for and remove empty clusters
+              imgClusterMap' <- readTVar (asImageCluster state)
+              let remainingClusterIds = Map.elems imgClusterMap'
+              forM_ affectedClusterIds $ \cid ->
+                when (cid `notElem` remainingClusterIds) $
+                  modifyTVar' (asClusters state) (Map.delete cid)
+            pure (length imagesToMove)
+          json $ object ["status" .= ("ok" :: Text), "moved" .= movedCount]
+
+    -- List existing folders for a year
+    get "/api/folders/:year" $ do
+      year <- captureParam "year" :: ActionM String
+      let yearDir = cfgDestDir (asConfig state) </> year
+      exists <- liftIO $ doesDirectoryExist yearDir
+      folders <- if exists
+        then liftIO $ do
+          entries <- listDirectory yearDir
+          filterM (\e -> doesDirectoryExist (yearDir </> e)) entries
+        else pure []
+      json $ map T.pack folders
+
+    -- Move images to existing folder
+    post "/api/move-to-folder" $ do
+      body' <- body
+      case decode body' :: Maybe FolderMoveRequest of
+        Nothing -> status status404 >> text "Invalid request"
+        Just req -> do
+          -- Get affected cluster IDs before moving
+          imgClusterMap <- liftIO $ readTVarIO (asImageCluster state)
+          let affectedClusterIds = [cid | imgId <- fmrImageIds req, Just cid <- [Map.lookup imgId imgClusterMap]]
+          let imagesToMove = [(imgId, imageFileMap Map.! imgId) | imgId <- fmrImageIds req, Map.member imgId imageFileMap]
+          movedCount <- liftIO $ do
+            forM_ imagesToMove $ \(_, pf) -> do
+              let (year, _, _) = toGregorian $ utctDay $ pfDateTime pf
+                  destFolder = cfgDestDir (asConfig state) </> show year </> T.unpack (fmrFolder req)
+              createDirectoryIfMissing True destFolder
+              let srcPath = pfPath pf
+                  destPath = destFolder </> takeFileName srcPath
+              copyFileWithMetadata srcPath destPath
+              removeFile srcPath
+            -- Remove images from cluster tracking and clean up empty clusters
+            atomically $ do
+              forM_ (fmrImageIds req) $ \imgId ->
+                modifyTVar' (asImageCluster state) (Map.delete imgId)
+              -- Check for and remove empty clusters
+              imgClusterMap' <- readTVar (asImageCluster state)
+              let remainingClusterIds = Map.elems imgClusterMap'
+              forM_ affectedClusterIds $ \cid ->
+                when (cid `notElem` remainingClusterIds) $
+                  modifyTVar' (asClusters state) (Map.delete cid)
+            pure (length imagesToMove)
+          json $ object ["status" .= ("ok" :: Text), "moved" .= movedCount]
+
+    -- Delete images
+    post "/api/delete-images" $ do
+      body' <- body
+      case decode body' :: Maybe MiscRequest of  -- Reuse MiscRequest (just needs image_ids)
+        Nothing -> status status404 >> text "Invalid request"
+        Just req -> do
+          -- Get affected cluster IDs before deleting
+          imgClusterMap <- liftIO $ readTVarIO (asImageCluster state)
+          let affectedClusterIds = [cid | imgId <- miscImageIds req, Just cid <- [Map.lookup imgId imgClusterMap]]
+          let imagesToDelete = [(imgId, imageFileMap Map.! imgId) | imgId <- miscImageIds req, Map.member imgId imageFileMap]
+          deletedCount <- liftIO $ do
+            forM_ imagesToDelete $ \(_, pf) -> do
+              let srcPath = pfPath pf
+              removeFile srcPath
+            -- Remove images from cluster tracking and clean up empty clusters
+            atomically $ do
+              forM_ (miscImageIds req) $ \imgId ->
+                modifyTVar' (asImageCluster state) (Map.delete imgId)
+              -- Check for and remove empty clusters
+              imgClusterMap' <- readTVar (asImageCluster state)
+              let remainingClusterIds = Map.elems imgClusterMap'
+              forM_ affectedClusterIds $ \cid ->
+                when (cid `notElem` remainingClusterIds) $
+                  modifyTVar' (asClusters state) (Map.delete cid)
+            pure (length imagesToDelete)
+          json $ object ["status" .= ("ok" :: Text), "deleted" .= deletedCount]
 
     -- Create new cluster
     post "/api/clusters/new" $ do
@@ -210,26 +370,45 @@ runWebUI cfg clusters = do
 
     -- Serve image preview (converts on demand)
     get "/api/images/:imageId" $ do
-      imgId <- captureParam "imageId"
+      imgIdStr <- captureParam "imageId" :: ActionM String
+      let imgId = read imgIdStr :: Int
+      liftIO $ putStrLn $ "Looking up image ID: " ++ show imgId ++ " (from string: " ++ imgIdStr ++ ")"
+      liftIO $ putStrLn $ "Map has key: " ++ show (Map.member imgId imageFileMap)
       case Map.lookup imgId imageFileMap of
-        Nothing -> status status404 >> text "Image not found"
+        Nothing -> status status404 >> text ("Image not found: " <> TL.pack (show imgId))
         Just pf -> do
           let outFile = asImageDir state </> ("img_" <> show imgId <> ".jpg")
           exists <- liftIO $ doesFileExist outFile
           when (not exists) $ liftIO $ convertImage (pfPath pf) outFile
           file outFile
 
--- | Convert image to JPEG for preview
+-- | Convert image/video to JPEG for preview
 convertImage :: FilePath -> FilePath -> IO ()
 convertImage src dst = do
-  let sipsProc = (proc "sips"
-        [ "-s", "format", "jpeg"
-        , "-Z", "800"
-        , src
-        , "--out", dst
-        ]) { std_out = CreatePipe, std_err = CreatePipe }
-  (_, _, _, ph) <- createProcess sipsProc
-  void $ waitForProcess ph
+  let ext = map toLower (takeExtension src)
+      isVideo = ext `elem` [".mp4", ".mov", ".m4v", ".avi", ".mkv"]
+  if isVideo
+    then do
+      -- Use ffmpeg to extract a frame from video
+      let ffmpegProc = (proc "ffmpeg"
+            [ "-i", src
+            , "-vf", "thumbnail,scale=800:-1"
+            , "-frames:v", "1"
+            , "-y"
+            , dst
+            ]) { std_out = CreatePipe, std_err = CreatePipe }
+      (_, _, _, ph) <- createProcess ffmpegProc
+      void $ waitForProcess ph
+    else do
+      -- Use sips for images
+      let sipsProc = (proc "sips"
+            [ "-s", "format", "jpeg"
+            , "-Z", "800"
+            , src
+            , "--out", dst
+            ]) { std_out = CreatePipe, std_err = CreatePipe }
+      (_, _, _, ph) <- createProcess sipsProc
+      void $ waitForProcess ph
 
 -- | Convert Cluster to JSON representation
 clusterToJSON :: Map Int PhotoFile -> Map Int Int -> FilePath -> Cluster -> ClusterJSON
@@ -241,29 +420,33 @@ clusterToJSON imageFileMap imgClusterMap _ cluster =
         ScreenshotsOnly -> "screenshots"
         PhotosVideos -> "photos"
         Mixed -> "mixed"
+      -- Extract year from first file, default to 2025
+      year = case images of
+        ((_, pf):_) -> let (y, _, _) = toGregorian (utctDay (pfDateTime pf)) in fromIntegral y
+        [] -> 2025
   in ClusterJSON
     { cjId = clId cluster
+    , cjYear = year
     , cjDate = clDate cluster
     , cjTimeRange = clTimeRange cluster
-    , cjPhotos = length [pf | (_, pf) <- images, pfType pf == Photo]
-    , cjScreenshots = length [pf | (_, pf) <- images, pfType pf == Screenshot]
-    , cjVideos = length [pf | (_, pf) <- images, pfType pf == Video]
-    , cjTotal = length images
-    , cjType = typeStr
+    , cjPhotoCount = length [pf | (_, pf) <- images, pfType pf == Photo]
+    , cjScreenshotCount = length [pf | (_, pf) <- images, pfType pf == Screenshot]
+    , cjVideoCount = length [pf | (_, pf) <- images, pfType pf == Video]
+    , cjFileCount = length images
+    , cjClusterType = typeStr
     , cjFolderName = clFolderName cluster
-    , cjImages = [imageToJSON imgId pf | (imgId, pf) <- images]
+    , cjFiles = [imageToJSON imgId pf | (imgId, pf) <- images]
     }
 
 imageToJSON :: Int -> PhotoFile -> ImageJSON
 imageToJSON imgId pf = ImageJSON
   { ijId = imgId
-  , ijFileName = pfFileName pf
+  , ijName = pfFileName pf
   , ijPath = T.pack $ pfPath pf
-  , ijType = case pfType pf of
+  , ijFileType = case pfType pf of
       Photo -> "photo"
       Screenshot -> "screenshot"
       Video -> "video"
-  , ijPreviewUrl = T.pack $ "/api/images/" <> show imgId
   }
 
 -- | The main HTML page

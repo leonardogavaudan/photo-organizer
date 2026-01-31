@@ -11,7 +11,7 @@ build-type:         Simple
 extra-doc-files:    CHANGELOG.md
 
 common warnings
-    ghc-options: -Wall -Wno-unused-do-bind
+    ghc-options: -Wall -Wno-unused-do-bind -threaded -rtsopts -with-rtsopts=-N
 
 executable photo-organizer
     import:           warnings
@@ -38,6 +38,7 @@ executable photo-organizer
                     , http-types
                     , bytestring
                     , stm
+                    , hashable
     hs-source-dirs:   app
     default-language: GHC2021
     default-extensions: OverloadedStrings
