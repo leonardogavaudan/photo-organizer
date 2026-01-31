@@ -155,10 +155,6 @@ runWebUI cfg clusters = do
   putStrLn ""
 
   scotty 8080 $ do
-    -- Debug endpoint to check imageFileMap keys
-    get "/api/debug/keys" $ do
-      json (Map.keys imageFileMap)
-
     -- Main page
     get "/" $ do
       html $ TL.pack indexHtml
@@ -350,11 +346,12 @@ runWebUI cfg clusters = do
             let imageIds = [imgId | (imgId, clustId) <- Map.toList imgClusterMap, clustId == cid]
                 imagesToMove = [(imgId, imageFileMap Map.! imgId) | imgId <- imageIds, Map.member imgId imageFileMap]
 
-            -- Move files
+            -- Move files (each to its corresponding year)
             liftIO $ do
-              let destFolder = cfgDestDir (asConfig state) </> "2025" </> T.unpack folderName
-              createDirectoryIfMissing True destFolder
               forM_ imagesToMove $ \(_, pf) -> do
+                let (year, _, _) = toGregorian $ utctDay $ pfDateTime pf
+                    destFolder = cfgDestDir (asConfig state) </> show year </> T.unpack folderName
+                createDirectoryIfMissing True destFolder
                 let srcPath = pfPath pf
                     destPath = destFolder </> takeFileName srcPath
                 copyFileWithMetadata srcPath destPath
@@ -372,10 +369,8 @@ runWebUI cfg clusters = do
     get "/api/images/:imageId" $ do
       imgIdStr <- captureParam "imageId" :: ActionM String
       let imgId = read imgIdStr :: Int
-      liftIO $ putStrLn $ "Looking up image ID: " ++ show imgId ++ " (from string: " ++ imgIdStr ++ ")"
-      liftIO $ putStrLn $ "Map has key: " ++ show (Map.member imgId imageFileMap)
       case Map.lookup imgId imageFileMap of
-        Nothing -> status status404 >> text ("Image not found: " <> TL.pack (show imgId))
+        Nothing -> status status404 >> text "Image not found"
         Just pf -> do
           let outFile = asImageDir state </> ("img_" <> show imgId <> ".jpg")
           exists <- liftIO $ doesFileExist outFile
